@@ -1,6 +1,6 @@
 # Deduplication Service
 A high-performance service designed to eliminate duplicate and near-duplicate content, ensuring diversity and token uniqueness in datasets. Built on Cloudflare Workers.
-> ✨ Powered by [wall-e](https://github.com/1712n/wall-e), a GitHub bot that supercharges spec-driven development through automated generation of Cloudflare Workers. 
+> 🤖 Powered by [WALL-E](https://github.com/1712n/wall-e), a GitHub bot that supercharges spec-driven development through automated generation of Cloudflare Workers. 
 
 ## Implementation approach
 
