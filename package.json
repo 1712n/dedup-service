@@ -9,6 +9,7 @@
     "start": "wrangler dev",
     "test": "vitest"
   },
+  "packageManager": "yarn@4.9.1",
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.4.2",
     "@cloudflare/workers-types": "^4.20240605.0",
