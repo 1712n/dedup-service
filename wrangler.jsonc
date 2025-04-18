@@ -2,7 +2,7 @@
   "name": "deduplication-service",
   "main": "src/index.ts",
   "compatibility_date": "2024-04-05",
-  "node_compat": true,
+  "nodejs_compat": true,
   "logpush": true,
   "routes": [
     {
