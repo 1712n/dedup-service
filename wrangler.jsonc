@@ -1,0 +1,27 @@
+{
+  "name": "deduplication-service",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-04-05",
+  "node_compat": true,
+  "logpush": true,
+  "routes": [
+    {
+      "pattern": "dedup-service.cfnlpbe.org",
+      "custom_domain": true
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "6d838af447464824818c4fe6f3ac394e",
+      "localConnectionString": "postgres://postgres:password@localhost:5432/class_worker_db"
+    }
+  ]
+}
+
