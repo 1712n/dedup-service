@@ -3,22 +3,9 @@
 
 import { Client } from "pg";
 
-export interface Env {
-  AI: {
-    run: (
-      modelName: string,
-      data: { text: string[] },
-    ) => Promise<{ data: number[][] }>;
-  };
-  HYPERDRIVE: {
-    connectionString: string;
-  };
-  DEDUP_AUTH_TOKEN: string;
-}
-
 interface Message {
   message_id: string;
-  timestamp?: string;
+  timestamp: string;
   content: string;
   platform_name?: string;
   platform_user_id?: string;
@@ -26,54 +13,60 @@ interface Message {
   platform_message_url?: string;
 }
 
-interface RequestData {
+interface BatchRequest {
   table_name: string;
   job_id: string;
   topic: string;
   industry: string;
-  subindustry: string;
+  subindustry?: string;
   similarity_search_score_threshold: number;
   filter_by?: string[];
   messages: Message[];
 }
 
-interface ResponseData {
-  table_name: string;
-  job_id: string;
-  topic: string;
-  industry: string;
-  subindustry: string;
-  similarity_search_score_threshold: number;
-  filter_by: string[];
-  stats: {
-    received: number;
-    inserted: number;
-    dropped: number;
-    insertion_rate: number;
-  };
-  non_duplicate_messages: {
-    message_id: string;
-    content: string;
-  }[];
+interface ProcessedMessage extends Message {
+  embedding: number[];
+  similarity_search_score: number;
 }
 
-const MODEL_NAME = "@cf/baai/bge-m3";
-const MAX_BATCH_SIZE = 100;
+interface Stats {
+  received: number;
+  inserted: number;
+  dropped: number;
+  insertion_rate: number;
+}
+
+interface ResponseMessage {
+  message_id: string;
+  content: string;
+}
+
+interface BatchResponse {
+  status: string;
+  data: {
+    table_name: string;
+    job_id: string;
+    topic: string;
+    industry: string;
+    subindustry?: string;
+    similarity_search_score_threshold: number;
+    filter_by: string[];
+    stats: Stats;
+    non_duplicate_messages: ResponseMessage[];
+  };
+  message: string;
+}
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise {
+  async fetch(request: Request, env: any): Promise {
     try {
       if (request.method !== "POST") {
         return new Response(
           JSON.stringify({
             status: "error",
-            message: "Method not allowed",
-            error: "Only POST requests are supported",
+            message: "Method not allowed. Use POST.",
           }),
-          {
-            status: 405,
-            headers: { "Content-Type": "application/json" },
-          },
+          { status: 405, headers: { "Content-Type": "application/json" } },
         );
       }
 
@@ -82,304 +75,364 @@ export default {
         return new Response(
           JSON.stringify({
             status: "error",
-            message: "Unauthorized",
-            error: "Invalid or missing authentication token",
+            message: "Unauthorized. Invalid or missing API key.",
           }),
-          {
-            status: 401,
-            headers: { "Content-Type": "application/json" },
-          },
+          { status: 401, headers: { "Content-Type": "application/json" } },
         );
       }
 
-      const requestData: RequestData = await request.json();
-      if (!validateRequestData(requestData)) {
+      let requestData: BatchRequest;
+      try {
+        requestData = await request.json();
+      } catch (error) {
         return new Response(
           JSON.stringify({
             status: "error",
-            message: "Invalid request data",
-            error: "Missing required fields or invalid format",
+            message: "Invalid JSON in request body.",
           }),
-          {
-            status: 400,
-            headers: { "Content-Type": "application/json" },
-          },
+          { status: 400, headers: { "Content-Type": "application/json" } },
         );
       }
 
-      const result = await processMessages(requestData, env);
+      if (
+        !requestData.table_name ||
+        !requestData.job_id ||
+        !requestData.topic ||
+        !requestData.industry ||
+        requestData.similarity_search_score_threshold === undefined ||
+        !requestData.messages ||
+        !Array.isArray(requestData.messages) ||
+        requestData.messages.length === 0
+      ) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            message: "Invalid request. Missing required fields.",
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (!/^[a-zA-Z0-9_]+$/.test(requestData.table_name)) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            message:
+              "Invalid table name. Only alphanumeric characters and underscores are allowed.",
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      if (
+        typeof requestData.similarity_search_score_threshold !== "number" ||
+        requestData.similarity_search_score_threshold < 0 ||
+        requestData.similarity_search_score_threshold > 1
+      ) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            message:
+              "Invalid similarity threshold. Must be a number between 0 and 1.",
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      const filterBy = requestData.filter_by || ["topic", "subindustry"];
+
+      const validFilterFields = ["topic", "industry", "subindustry", "job_id"];
+      const invalidFilters = filterBy.filter(
+        (field) => !validFilterFields.includes(field),
+      );
+      if (invalidFilters.length > 0) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            message: `Invalid filter fields: ${invalidFilters.join(", ")}. Valid fields are: ${validFilterFields.join(", ")}.`,
+          }),
+          { status: 400, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      const result = await processBatch(requestData, filterBy, env);
+
       return new Response(JSON.stringify(result), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
     } catch (error) {
-      console.error("ERROR: Processing request failed:", error);
+      console.error(`ERROR: Error processing request: ${error}`);
       return new Response(
         JSON.stringify({
           status: "error",
-          message: "Internal server error",
-          error: error instanceof Error ? error.message : "Unknown error",
+          message: "An internal server error occurred.",
         }),
-        {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        },
+        { status: 500, headers: { "Content-Type": "application/json" } },
       );
     }
   },
 };
 
-function validateRequestData(data: any): boolean {
-  if (!data) return false;
+async function processBatch(
+  request: BatchRequest,
+  filterBy: string[],
+  env: any,
+): Promise {
+  let client = null;
 
-  if (
-    !data.table_name ||
-    !data.job_id ||
-    !data.topic ||
-    !data.industry ||
-    typeof data.similarity_search_score_threshold !== "number" ||
-    !Array.isArray(data.messages)
-  ) {
-    return false;
-  }
-
-  if (
-    data.similarity_search_score_threshold < 0 ||
-    data.similarity_search_score_threshold > 1
-  ) {
-    return false;
-  }
-
-  if (data.messages.length === 0) {
-    return false;
-  }
-
-  for (const message of data.messages) {
-    if (!message.message_id || !message.content) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-async function processMessages(requestData: RequestData, env: Env): Promise {
-  const startTime = Date.now();
-  console.info(
-    `INFO: Starting batch processing for job_id: ${requestData.job_id}, received ${requestData.messages.length} messages`,
-  );
-
-  const filterBy = requestData.filter_by || ["topic", "subindustry"];
-
-  // Remove exact duplicates first
-  const uniqueContentMap = new Map<string, Message>();
-  for (const message of requestData.messages) {
-    uniqueContentMap.set(message.content, message);
-  }
-
-  const uniqueMessages = Array.from(uniqueContentMap.values());
-  const exactDuplicatesCount =
-    requestData.messages.length - uniqueMessages.length;
-  console.info(
-    `INFO: Removed ${exactDuplicatesCount} exact duplicate messages`,
-  );
-
-  // Connect to database
-  const client = new Client({
-    connectionString: env.HYPERDRIVE.connectionString,
-  });
   try {
+    console.log(`INFO: Starting batch processing for job ${request.job_id}`);
+
+    const stats: Stats = {
+      received: request.messages.length,
+      inserted: 0,
+      dropped: 0,
+      insertion_rate: 0,
+    };
+
+    client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
     await client.connect();
-    console.info(`INFO: Database connection established`);
-
-    const nonDuplicateMessages: { message_id: string; content: string }[] = [];
-    let insertedCount = 0;
-
-    // Process messages in batches for embeddings
-    const batchCount = Math.ceil(uniqueMessages.length / MAX_BATCH_SIZE);
-    console.info(
-      `INFO: Processing ${uniqueMessages.length} messages in ${batchCount} batches`,
+    console.log(
+      `INFO: Database connection established for job ${request.job_id}`,
     );
 
-    for (let batchIndex = 0; batchIndex < batchCount; batchIndex++) {
-      const batchStart = batchIndex * MAX_BATCH_SIZE;
-      const batchEnd = Math.min(
-        batchStart + MAX_BATCH_SIZE,
-        uniqueMessages.length,
+    const uniqueContentMessages = removeDuplicatesByContent(request.messages);
+    const initialDropped = stats.received - uniqueContentMessages.length;
+    stats.dropped = initialDropped;
+    console.log(
+      `INFO: Removed ${initialDropped} exact duplicates, ${uniqueContentMessages.length} messages remaining`,
+    );
+
+    const nonDuplicateMessages: ResponseMessage[] = [];
+
+    for (let i = 0; i < uniqueContentMessages.length; i += 100) {
+      const messageBatch = uniqueContentMessages.slice(i, i + 100);
+      console.log(
+        `INFO: Processing batch ${Math.floor(i / 100) + 1} with ${messageBatch.length} messages`,
       );
-      const messageBatch = uniqueMessages.slice(batchStart, batchEnd);
+
+      const texts = messageBatch.map((msg) => msg.content);
 
       try {
-        // Get embeddings for the batch
-        const batchTexts = messageBatch.map((message) => message.content);
-        const embeddingResponse = await env.AI.run(MODEL_NAME, {
-          text: batchTexts,
-        });
-        const embeddings = embeddingResponse.data;
+        const modelName = "@cf/baai/bge-m3";
+        const embeddingResponse = await env.AI.run(modelName, { text: texts });
 
-        // Process each message
-        for (let i = 0; i < messageBatch.length; i++) {
-          const message = messageBatch[i];
-          const embedding = embeddings[i];
-          const formattedEmbedding = `[${embedding.join(",")}]`;
-
+        for (let j = 0; j < messageBatch.length; j++) {
+          const message = messageBatch[j];
           try {
-            // Build filter conditions and parameters
-            const filterParams = [];
-            const filterConditions = filterBy
-              .map((field) => {
-                if (field === "job_id") {
-                  filterParams.push(requestData.job_id);
-                  return `job_id = $${filterParams.length}`;
-                }
-                if (field === "topic") {
-                  filterParams.push(requestData.topic);
-                  return `topic = $${filterParams.length}`;
-                }
-                if (field === "industry") {
-                  filterParams.push(requestData.industry);
-                  return `industry = $${filterParams.length}`;
-                }
-                if (field === "subindustry") {
-                  filterParams.push(requestData.subindustry);
-                  return `subindustry = $${filterParams.length}`;
-                }
-                return null;
-              })
-              .filter(Boolean)
-              .join(" AND ");
+            const embedding = embeddingResponse.data[j];
+            const formattedEmbedding = `[${embedding.join(",")}]`;
 
-            // Add embedding parameter
-            filterParams.push(formattedEmbedding);
-
-            // Check for similar messages
-            const similarityQuery = `
-              SELECT content, embedding <=> $${filterParams.length}::vector AS distance
-              FROM ${requestData.table_name}
-              ${filterConditions ? `WHERE ${filterConditions}` : ""}
-              ORDER BY distance ASC
-              LIMIT 1;
-            `;
-
-            const similarityResult = await client.query(
-              similarityQuery,
-              filterParams,
+            const similaritySearchScore = await checkSimilarity(
+              client,
+              request.table_name,
+              formattedEmbedding,
+              filterBy,
+              request,
             );
 
-            let similarityScore = 0;
-            if (similarityResult.rows.length > 0) {
-              const distance = similarityResult.rows[0].distance;
-              // Convert distance to similarity score (higher means more similar)
-              similarityScore = 1 / (1 + distance);
-            }
+            console.log(
+              `INFO: Message ${message.message_id} similarity score: ${similaritySearchScore}`,
+            );
 
-            // Check if message exceeds similarity threshold
             if (
-              similarityScore > requestData.similarity_search_score_threshold
+              similaritySearchScore < request.similarity_search_score_threshold
             ) {
-              console.info(
-                `INFO: Dropped near-duplicate message ${message.message_id}, similarity: ${similarityScore}`,
-              );
-            } else {
-              // Insert non-duplicate message
-              const insertQuery = `
-                INSERT INTO ${requestData.table_name} (
-                  job_id, message_id, timestamp, topic, industry, subindustry, 
-                  content, embedding, similarity_search_score,
-                  platform_name, platform_user_id, platform_message_id, platform_message_url
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-                RETURNING id;
-              `;
+              const processedMessage: ProcessedMessage = {
+                ...message,
+                embedding,
+                similarity_search_score: similaritySearchScore,
+              };
 
-              const insertParams = [
-                requestData.job_id,
-                message.message_id,
-                message.timestamp || new Date().toISOString(),
-                requestData.topic,
-                requestData.industry,
-                requestData.subindustry || null,
-                message.content,
+              await insertMessage(
+                client,
+                request.table_name,
+                processedMessage,
                 formattedEmbedding,
-                similarityScore,
-                message.platform_name || null,
-                message.platform_user_id || null,
-                message.platform_message_id || null,
-                message.platform_message_url || null,
-              ];
-
-              const insertResult = await client.query(
-                insertQuery,
-                insertParams,
+                request,
               );
 
-              if (insertResult.rows.length > 0) {
-                insertedCount++;
-                nonDuplicateMessages.push({
-                  message_id: message.message_id,
-                  content: message.content,
-                });
-                console.info(
-                  `INFO: Inserted message ${message.message_id}, similarity: ${similarityScore}`,
-                );
-              }
+              nonDuplicateMessages.push({
+                message_id: message.message_id,
+                content: message.content,
+              });
+
+              stats.inserted++;
+              console.log(`INFO: Inserted message ${message.message_id}`);
+            } else {
+              stats.dropped++;
+              console.log(
+                `INFO: Dropped message ${message.message_id} due to high similarity`,
+              );
             }
           } catch (error) {
             console.error(
-              `ERROR: Failed processing message ${message.message_id}:`,
-              error,
+              `ERROR: Failed to process message ${message.message_id}: ${error}`,
             );
+            stats.dropped++;
           }
         }
       } catch (error) {
-        console.error(
-          `ERROR: Failed processing batch ${batchIndex + 1}:`,
-          error,
-        );
+        console.error(`ERROR: Failed to get embeddings for batch: ${error}`);
+        stats.dropped += messageBatch.length;
       }
     }
 
-    const totalReceived = requestData.messages.length;
-    const totalDropped = totalReceived - insertedCount;
-    const insertionRate = totalReceived > 0 ? insertedCount / totalReceived : 0;
+    stats.insertion_rate = stats.inserted / stats.received;
 
-    const responseData: ResponseData = {
-      table_name: requestData.table_name,
-      job_id: requestData.job_id,
-      topic: requestData.topic,
-      industry: requestData.industry,
-      subindustry: requestData.subindustry,
-      similarity_search_score_threshold:
-        requestData.similarity_search_score_threshold,
-      filter_by: filterBy,
-      stats: {
-        received: totalReceived,
-        inserted: insertedCount,
-        dropped: totalDropped,
-        insertion_rate: insertionRate,
-      },
-      non_duplicate_messages: nonDuplicateMessages,
-    };
-
-    const processingTime = (Date.now() - startTime) / 1000;
-    console.info(
-      `INFO: Completed processing for job_id: ${requestData.job_id} in ${processingTime}s. Inserted: ${insertedCount}/${totalReceived}`,
-    );
-
-    return {
+    const response: BatchResponse = {
       status: "success",
-      data: responseData,
+      data: {
+        table_name: request.table_name,
+        job_id: request.job_id,
+        topic: request.topic,
+        industry: request.industry,
+        subindustry: request.subindustry,
+        similarity_search_score_threshold:
+          request.similarity_search_score_threshold,
+        filter_by: filterBy,
+        stats,
+        non_duplicate_messages: nonDuplicateMessages,
+      },
       message: "Batch processing completed successfully",
     };
+
+    console.log(
+      `INFO: Completed batch processing for job ${request.job_id}. Inserted ${stats.inserted}/${stats.received}`,
+    );
+    return response;
   } catch (error) {
-    console.error(`ERROR: Failed to process batch:`, error);
+    console.error(`ERROR: Failed to process batch: ${error}`);
     throw error;
   } finally {
-    try {
-      await client.end();
-      console.info(`INFO: Database connection closed`);
-    } catch (err) {
-      console.error(`ERROR: Failed to close database connection:`, err);
+    if (client) {
+      try {
+        await client.end();
+        console.log(
+          `INFO: Database connection closed for job ${request.job_id}`,
+        );
+      } catch (error) {
+        console.error(`ERROR: Failed to close database connection: ${error}`);
+      }
     }
+  }
+}
+
+function removeDuplicatesByContent(messages: Message[]): Message[] {
+  try {
+    const uniqueContents = new Set();
+    const uniqueMessages: Message[] = [];
+
+    messages.forEach((message) => {
+      if (!uniqueContents.has(message.content)) {
+        uniqueContents.add(message.content);
+        uniqueMessages.push(message);
+      }
+    });
+
+    return uniqueMessages;
+  } catch (error) {
+    console.error(`ERROR: Failed to remove duplicates by content: ${error}`);
+    throw error;
+  }
+}
+
+async function checkSimilarity(
+  client: Client,
+  tableName: string,
+  embedding: string,
+  filterBy: string[],
+  request: BatchRequest,
+): Promise {
+  try {
+    const whereConditions = [];
+    const params = [];
+    let paramCounter = 1;
+
+    filterBy.forEach((field) => {
+      if (field === "topic" && request.topic) {
+        whereConditions.push(`topic = $${paramCounter++}`);
+        params.push(request.topic);
+      } else if (field === "industry" && request.industry) {
+        whereConditions.push(`industry = $${paramCounter++}`);
+        params.push(request.industry);
+      } else if (field === "subindustry" && request.subindustry) {
+        whereConditions.push(`subindustry = $${paramCounter++}`);
+        params.push(request.subindustry);
+      } else if (field === "job_id" && request.job_id) {
+        whereConditions.push(`job_id = $${paramCounter++}`);
+        params.push(request.job_id);
+      }
+    });
+
+    const whereClause =
+      whereConditions.length > 0
+        ? `WHERE ${whereConditions.join(" AND ")}`
+        : "";
+
+    const countQuery = `SELECT COUNT(*) FROM ${tableName} ${whereClause}`;
+    const countResult = await client.query(countQuery, params);
+
+    if (parseInt(countResult.rows[0].count) === 0) {
+      return 0;
+    }
+
+    params.push(embedding);
+
+    const query = `
+      SELECT 1 - (embedding <=> $${paramCounter}::vector) as similarity
+      FROM ${tableName}
+      ${whereClause}
+      ORDER BY similarity DESC
+      LIMIT 1;
+    `;
+
+    const result = await client.query(query, params);
+
+    return result.rows.length > 0 ? parseFloat(result.rows[0].similarity) : 0;
+  } catch (error) {
+    console.error(`ERROR: Failed to check similarity: ${error}`);
+    throw error;
+  }
+}
+
+async function insertMessage(
+  client: Client,
+  tableName: string,
+  message: ProcessedMessage,
+  formattedEmbedding: string,
+  request: BatchRequest,
+): Promise {
+  try {
+    const query = `
+      INSERT INTO ${tableName} (
+        job_id, message_id, timestamp, topic, industry, subindustry,
+        content, embedding, similarity_search_score, platform_name,
+        platform_user_id, platform_message_id, platform_message_url
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+    `;
+
+    await client.query(query, [
+      request.job_id,
+      message.message_id,
+      message.timestamp,
+      request.topic,
+      request.industry,
+      request.subindustry || null,
+      message.content,
+      formattedEmbedding,
+      message.similarity_search_score,
+      message.platform_name || null,
+      message.platform_user_id || null,
+      message.platform_message_id || null,
+      message.platform_message_url || null,
+    ]);
+  } catch (error) {
+    console.error(
+      `ERROR: Failed to insert message ${message.message_id}: ${error}`,
+    );
+    throw error;
   }
 }
