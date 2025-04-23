@@ -3,16 +3,6 @@
 
 import { Client } from "pg";
 
-export interface Env {
-  AI: {
-    run: (modelName: string, inputs: any) => Promise;
-  };
-  HYPERDRIVE: {
-    connectionString: string;
-  };
-  DEDUP_AUTH_TOKEN: string;
-}
-
 interface Message {
   message_id: string;
   timestamp: string;
@@ -23,7 +13,7 @@ interface Message {
   platform_message_url: string;
 }
 
-interface RequestPayload {
+interface RequestData {
   table_name: string;
   job_id: string;
   topic: string;
@@ -34,375 +24,354 @@ interface RequestPayload {
   messages: Message[];
 }
 
-interface ResponseMessage {
-  message_id: string;
-  content: string;
-}
-
-interface ResponseStats {
-  received: number;
-  inserted: number;
+interface ProcessingResult {
+  inserted: Array<{ message_id: string; content: string }>;
   dropped: number;
-  insertion_rate: number;
-}
-
-interface ResponsePayload {
-  status: string;
-  data: {
-    table_name: string;
-    job_id: string;
-    topic: string;
-    industry: string;
-    subindustry: string;
-    similarity_search_score_threshold: number;
-    filter_by: string[];
-    stats: ResponseStats;
-    non_duplicate_messages: ResponseMessage[];
-  };
-  message: string;
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise {
+  async fetch(request: Request, env: any, ctx: ExecutionContext): Promise {
+    if (request.method !== "POST") {
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          message: "Method not allowed. Use POST.",
+        }),
+        { status: 405, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    const authToken = request.headers.get("Authorization");
+    if (
+      !authToken ||
+      !authToken.startsWith("Bearer ") ||
+      authToken.substring(7) !== env.DEDUP_AUTH_TOKEN
+    ) {
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          message: "Unauthorized. Invalid token.",
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    let client = null;
     try {
-      console.log("INFO: Received request");
+      const data: RequestData = await request.json();
+      console.log(
+        `INFO: Processing job=${data.job_id}, received ${data.messages.length} messages`,
+      );
 
-      if (request.method !== "POST") {
-        console.log("INFO: Method not allowed");
+      if (!isValidRequest(data)) {
         return new Response(
           JSON.stringify({
             status: "error",
-            message: "Method not allowed",
+            message: "Invalid request format",
           }),
-          {
-            status: 405,
-            headers: { "Content-Type": "application/json" },
-          },
+          { status: 400, headers: { "Content-Type": "application/json" } },
         );
       }
 
-      const authToken = request.headers.get("Authorization");
-      if (
-        !authToken ||
-        !authToken.startsWith("Bearer ") ||
-        authToken.slice(7) !== env.DEDUP_AUTH_TOKEN
-      ) {
-        console.log("INFO: Unauthorized request");
-        return new Response(
-          JSON.stringify({
-            status: "error",
-            message: "Unauthorized",
-          }),
-          {
-            status: 401,
-            headers: { "Content-Type": "application/json" },
-          },
-        );
-      }
+      const filterBy = data.filter_by || ["topic", "subindustry"];
+      const uniqueMessages = removeDuplicates(data.messages);
+      const exactDuplicatesCount = data.messages.length - uniqueMessages.length;
+      console.log(`INFO: Removed ${exactDuplicatesCount} exact duplicates`);
 
-      const payload: RequestPayload = await request.json();
-      console.log(
-        `INFO: Processing ${payload.messages.length} messages for job ${payload.job_id}`,
-      );
-
-      const result = await processMessages(payload, env);
-
-      console.log(
-        `INFO: Completed processing. Inserted ${result.data.stats.inserted} messages`,
-      );
-      return new Response(JSON.stringify(result), {
-        headers: { "Content-Type": "application/json" },
+      client = new Client({
+        connectionString: env.HYPERDRIVE.connectionString,
       });
+      await client.connect();
+      console.log("INFO: Connected to database");
+
+      const results = await processMessages(
+        client,
+        env,
+        data,
+        uniqueMessages,
+        filterBy,
+      );
+
+      const stats = {
+        received: data.messages.length,
+        inserted: results.inserted.length,
+        dropped: exactDuplicatesCount + results.dropped,
+        insertion_rate:
+          data.messages.length > 0
+            ? results.inserted.length / data.messages.length
+            : 0,
+      };
+
+      return new Response(
+        JSON.stringify({
+          status: "success",
+          data: {
+            table_name: data.table_name,
+            job_id: data.job_id,
+            topic: data.topic,
+            industry: data.industry,
+            subindustry: data.subindustry,
+            similarity_search_score_threshold:
+              data.similarity_search_score_threshold,
+            filter_by: filterBy,
+            stats,
+            non_duplicate_messages: results.inserted,
+          },
+          message: "Batch processing completed successfully",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
     } catch (error) {
-      console.error(`ERROR: Worker exception: ${error.message}`);
+      console.error(`ERROR: Request processing failed: ${error.message}`);
       return new Response(
         JSON.stringify({
           status: "error",
           message: "Internal server error",
         }),
-        {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        },
+        { status: 500, headers: { "Content-Type": "application/json" } },
       );
+    } finally {
+      if (client) {
+        try {
+          await client.end();
+          console.log("INFO: Database connection closed");
+        } catch (e) {
+          console.error(
+            `ERROR: Failed to close database connection: ${e.message}`,
+          );
+        }
+      }
     }
   },
 };
 
-async function processMessages(payload: RequestPayload, env: Env): Promise {
-  try {
-    const filter_by = payload.filter_by || ["topic", "subindustry"];
+function isValidRequest(data: RequestData): boolean {
+  if (
+    !data.table_name ||
+    !data.job_id ||
+    !data.topic ||
+    !data.industry ||
+    !data.messages ||
+    !Array.isArray(data.messages) ||
+    typeof data.similarity_search_score_threshold !== "number" ||
+    data.similarity_search_score_threshold < 0 ||
+    data.similarity_search_score_threshold > 1 ||
+    !/^[a-zA-Z0-9_]+$/.test(data.table_name)
+  ) {
+    return false;
+  }
 
-    const stats: ResponseStats = {
-      received: payload.messages.length,
-      inserted: 0,
-      dropped: 0,
-      insertion_rate: 0,
-    };
+  if (data.filter_by) {
+    const validFields = ["job_id", "topic", "industry", "subindustry"];
+    if (!data.filter_by.every((f) => validFields.includes(f))) return false;
+  }
 
-    const nonDuplicateMessages: ResponseMessage[] = [];
+  return true;
+}
 
-    console.log("INFO: Removing exact duplicates");
-    const uniqueMessages = removeDuplicatesByContent(payload.messages);
-    stats.dropped = stats.received - uniqueMessages.length;
-    console.log(
-      `INFO: Removed ${stats.dropped} exact duplicates, ${uniqueMessages.length} unique messages remain`,
-    );
+function removeDuplicates(messages: Message[]): Message[] {
+  const seen = new Set();
+  return messages.filter((msg) => {
+    if (seen.has(msg.content)) return false;
+    seen.add(msg.content);
+    return true;
+  });
+}
 
-    console.log("INFO: Connecting to database");
-    const dbClient = new Client({
-      connectionString: env.HYPERDRIVE.connectionString,
-    });
-    await dbClient.connect();
+async function processMessages(
+  client: any,
+  env: any,
+  data: RequestData,
+  messages: Message[],
+  filterBy: string[],
+): Promise {
+  const inserted: Array<{ message_id: string; content: string }> = [];
+  let dropped = 0;
+  const batchSize = 100;
 
+  for (let i = 0; i < messages.length; i += batchSize) {
+    const batch = messages.slice(i, i + batchSize);
     try {
-      console.log("INFO: Starting sequential message processing");
-      const insertedMessages = await processMessagesSequentially(
-        uniqueMessages,
-        payload,
-        filter_by,
-        dbClient,
+      const embeddings = await generateEmbeddings(
+        batch.map((msg) => msg.content),
         env,
       );
-
-      stats.inserted = insertedMessages.length;
-      stats.dropped += uniqueMessages.length - insertedMessages.length;
-      stats.insertion_rate =
-        stats.received > 0 ? stats.inserted / stats.received : 0;
-
-      insertedMessages.forEach((msg) => {
-        nonDuplicateMessages.push({
-          message_id: msg.message_id,
-          content: msg.content,
-        });
-      });
-
       console.log(
-        `INFO: Completed processing. Inserted ${stats.inserted} messages, dropped ${stats.dropped} messages`,
+        `INFO: Generated embeddings for batch of ${batch.length} messages`,
       );
-    } finally {
-      await dbClient.end();
-    }
-
-    const response: ResponsePayload = {
-      status: "success",
-      data: {
-        table_name: payload.table_name,
-        job_id: payload.job_id,
-        topic: payload.topic,
-        industry: payload.industry,
-        subindustry: payload.subindustry,
-        similarity_search_score_threshold:
-          payload.similarity_search_score_threshold,
-        filter_by: filter_by,
-        stats: stats,
-        non_duplicate_messages: nonDuplicateMessages,
-      },
-      message: "Batch processing completed successfully",
-    };
-
-    return response;
-  } catch (error) {
-    console.error(`ERROR: Failed to process messages: ${error.message}`);
-    throw error;
-  }
-}
-
-function removeDuplicatesByContent(messages: Message[]): Message[] {
-  try {
-    const uniqueContents = new Set();
-    return messages.filter((message) => {
-      if (uniqueContents.has(message.content)) {
-        return false;
-      }
-      uniqueContents.add(message.content);
-      return true;
-    });
-  } catch (error) {
-    console.error(`ERROR: Failed to remove duplicates: ${error.message}`);
-    throw error;
-  }
-}
-
-async function processMessagesSequentially(
-  messages: Message[],
-  payload: RequestPayload,
-  filter_by: string[],
-  dbClient: Client,
-  env: Env,
-): Promise<Message[]> {
-  try {
-    const insertedMessages: Message[] = [];
-    const batchSize = 100;
-
-    for (let i = 0; i < messages.length; i += batchSize) {
-      const batch = messages.slice(i, i + batchSize);
-      console.log(
-        `INFO: Processing batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(messages.length / batchSize)}`,
-      );
-
-      const batchTexts = batch.map((msg) => msg.content);
-      const embeddings = await generateEmbeddings(batchTexts, env);
 
       for (let j = 0; j < batch.length; j++) {
-        const message = batch[j];
-        const embedding = embeddings[j];
-
         try {
-          const similarityScore = await checkSimilarity(
-            embedding,
-            payload,
-            filter_by,
-            dbClient,
+          const message = batch[j];
+          const embedding = embeddings[j];
+          const formattedEmbedding = `[${embedding.join(",")}]`;
+
+          const similarityResult = await checkSimilarity(
+            client,
+            data.table_name,
+            formattedEmbedding,
+            data.job_id,
+            data.topic,
+            data.industry,
+            data.subindustry,
+            filterBy,
           );
 
-          if (similarityScore < payload.similarity_search_score_threshold) {
+          if (
+            !similarityResult ||
+            similarityResult.similarity_score <
+              data.similarity_search_score_threshold
+          ) {
+            const similarityScore = similarityResult?.similarity_score || 0;
             await insertMessage(
+              client,
+              data.table_name,
+              data.job_id,
               message,
-              embedding,
+              data.topic,
+              data.industry,
+              data.subindustry,
+              formattedEmbedding,
               similarityScore,
-              payload,
-              dbClient,
             );
-
-            insertedMessages.push(message);
+            inserted.push({
+              message_id: message.message_id,
+              content: message.content,
+            });
             console.log(
-              `INFO: Inserted message ${message.message_id} with similarity score ${similarityScore}`,
+              `INFO: Inserted message=${message.message_id}, similarity=${similarityScore}`,
             );
           } else {
+            dropped++;
             console.log(
-              `INFO: Dropped near-duplicate message ${message.message_id} with similarity score ${similarityScore}`,
+              `INFO: Dropped message=${message.message_id}, similarity=${similarityResult.similarity_score}`,
             );
           }
-        } catch (error) {
-          console.error(
-            `ERROR: Failed to process message ${message.message_id}: ${error.message}`,
-          );
+        } catch (e) {
+          console.error(`ERROR: Processing message failed: ${e.message}`);
+          dropped++;
         }
       }
+    } catch (e) {
+      console.error(`ERROR: Batch processing failed: ${e.message}`);
+      dropped += batch.length;
     }
-
-    return insertedMessages;
-  } catch (error) {
-    console.error(
-      `ERROR: Failed to process messages sequentially: ${error.message}`,
-    );
-    throw error;
   }
+
+  return { inserted, dropped };
 }
 
 async function generateEmbeddings(
   texts: string[],
-  env: Env,
+  env: any,
 ): Promise<number[][]> {
   try {
-    const modelName = "@cf/baai/bge-base-en-v1.5";
-    console.log(`INFO: Generating embeddings for ${texts.length} texts`);
-
-    const resp = await env.AI.run(modelName, { text: texts });
-    return resp.data;
-  } catch (error) {
-    console.error(`ERROR: Failed to generate embeddings: ${error.message}`);
-    throw new Error(`Failed to generate embeddings: ${error.message}`);
+    const modelName = "bge-m3";
+    const response = await env.AI.run(modelName, { text: texts });
+    return response.data;
+  } catch (e) {
+    console.error(`ERROR: Embedding generation failed: ${e.message}`);
+    throw e;
   }
 }
 
 async function checkSimilarity(
-  embedding: number[],
-  payload: RequestPayload,
-  filter_by: string[],
-  dbClient: Client,
-): Promise {
+  client: any,
+  tableName: string,
+  embedding: string,
+  jobId: string,
+  topic: string,
+  industry: string,
+  subindustry: string,
+  filterBy: string[],
+): Promise<{ similarity_score: number; content: string } | null> {
   try {
-    const filterParams: any[] = [];
-    const filterConditions = filter_by
-      .map((field) => {
-        if (field === "topic") {
-          filterParams.push(payload.topic);
-          return `topic = $${filterParams.length}`;
-        }
-        if (field === "industry") {
-          filterParams.push(payload.industry);
-          return `industry = $${filterParams.length}`;
-        }
-        if (field === "subindustry") {
-          filterParams.push(payload.subindustry);
-          return `subindustry = $${filterParams.length}`;
-        }
-        if (field === "job_id") {
-          filterParams.push(payload.job_id);
-          return `job_id = $${filterParams.length}`;
-        }
-        return "";
-      })
-      .filter((cond) => cond !== "")
-      .join(" AND ");
+    const conditions = [];
+    const params = [];
+    let idx = 1;
 
-    if (!filterConditions) {
-      return 0;
+    if (filterBy.includes("job_id")) {
+      conditions.push(`job_id = $${idx++}`);
+      params.push(jobId);
+    }
+    if (filterBy.includes("topic")) {
+      conditions.push(`topic = $${idx++}`);
+      params.push(topic);
+    }
+    if (filterBy.includes("industry")) {
+      conditions.push(`industry = $${idx++}`);
+      params.push(industry);
+    }
+    if (filterBy.includes("subindustry") && subindustry) {
+      conditions.push(`subindustry = $${idx++}`);
+      params.push(subindustry);
     }
 
-    const formattedEmbedding = `[${embedding.join(",")}]`;
-    filterParams.push(formattedEmbedding);
+    const whereClause =
+      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    params.push(embedding);
 
     const query = `
-      SELECT 1 - (embedding <=> $${filterParams.length}::vector) as similarity_score
-      FROM ${payload.table_name}
-      WHERE ${filterConditions}
-      ORDER BY embedding <=> $${filterParams.length}::vector
+      SELECT 1 - (embedding <=> $${idx}::vector) as similarity_score, content
+      FROM ${tableName}
+      ${whereClause}
+      ORDER BY similarity_score DESC
       LIMIT 1;
     `;
 
-    const result = await dbClient.query(query, filterParams);
-
-    if (result.rows.length === 0) {
-      return 0;
-    }
-
-    return result.rows[0].similarity_score;
-  } catch (error) {
-    console.error(`ERROR: Failed to check similarity: ${error.message}`);
-    throw new Error(`Failed to check similarity: ${error.message}`);
+    const result = await client.query(query, params);
+    return result.rows.length > 0
+      ? {
+          similarity_score: result.rows[0].similarity_score,
+          content: result.rows[0].content,
+        }
+      : null;
+  } catch (e) {
+    console.error(`ERROR: Similarity check failed: ${e.message}`);
+    throw e;
   }
 }
 
 async function insertMessage(
+  client: any,
+  tableName: string,
+  jobId: string,
   message: Message,
-  embedding: number[],
+  topic: string,
+  industry: string,
+  subindustry: string,
+  embedding: string,
   similarityScore: number,
-  payload: RequestPayload,
-  dbClient: Client,
 ): Promise {
   try {
-    const formattedEmbedding = `[${embedding.join(",")}]`;
-
     const query = `
-      INSERT INTO ${payload.table_name} 
-      (job_id, message_id, timestamp, topic, industry, subindustry, content, 
-       embedding, similarity_search_score, platform_name, platform_user_id, 
-       platform_message_id, platform_message_url)
+      INSERT INTO ${tableName} (
+        job_id, message_id, timestamp, topic, industry, subindustry, 
+        content, embedding, similarity_search_score, platform_name, 
+        platform_user_id, platform_message_id, platform_message_url
+      ) 
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     `;
 
-    await dbClient.query(query, [
-      payload.job_id,
+    await client.query(query, [
+      jobId,
       message.message_id,
       message.timestamp,
-      payload.topic,
-      payload.industry,
-      payload.subindustry,
+      topic,
+      industry,
+      subindustry || null,
       message.content,
-      formattedEmbedding,
+      embedding,
       similarityScore,
       message.platform_name,
       message.platform_user_id,
       message.platform_message_id,
       message.platform_message_url,
     ]);
-  } catch (error) {
+  } catch (e) {
     console.error(
-      `ERROR: Failed to insert message ${message.message_id}: ${error.message}`,
+      `ERROR: Message insertion failed for ${message.message_id}: ${e.message}`,
     );
-    throw new Error(`Failed to insert message: ${error.message}`);
+    throw e;
   }
 }
