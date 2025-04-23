@@ -5,7 +5,7 @@
  * ## Key Functionality
  * - Exact text match duplicates are removed immediately after being received.
  * - Near-duplicates are removed based on the provided similarity search score threshold value:
- *    - Vector embeddings can be obtained from a Cloudflare Workers AI embedding model (`@cf/baai/bge-m3`).*    - Vector embeddings can be obtained from a Cloudflare Workers AI embedding model (`@cf/baai/bge-m3).*    - Vector embeddings can be obtained from a Cloudflare Workers AI embedding model (`@cf/baai/bge-m3`).*    - Vector embeddings can be obtained from a Cloudflare Workers AI embedding model (`@cf/baai/bge-m3).
+ *    - Vector embeddings can be obtained from a Cloudflare Workers AI embedding model (`@cf/baai/bge-m3`).
  *    - Similarity search scores are obtained from the closest match (highest similarity score) when performing a search against existing db records filtered by fields specified in the `filter_by` parameter. Any messages with similarity search scores exceeding the batch-level similarity search score threshold are dropped. Only messages with similarity search scores under the threshold value are inserted into the database. 
  *    - Each newly inserted message becomes part of the existing records for subsequent message checks. The sequential processing ensures that only the first occurrence of similar messages within a batch will be inserted.
  *
