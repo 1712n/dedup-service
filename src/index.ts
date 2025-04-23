@@ -5,7 +5,10 @@ import { Client } from "pg";
 
 export interface Env {
   AI: {
-    run: (modelName: string, inputs: any) => Promise;
+    run: (
+      model: string,
+      input: { text: string[] },
+    ) => Promise<{ data: number[][] }>;
   };
   HYPERDRIVE: {
     connectionString: string;
@@ -23,7 +26,7 @@ interface Message {
   platform_message_url: string;
 }
 
-interface RequestPayload {
+interface RequestData {
   table_name: string;
   job_id: string;
   topic: string;
@@ -34,45 +37,50 @@ interface RequestPayload {
   messages: Message[];
 }
 
-interface ResponseMessage {
+interface NonDuplicateMessage {
   message_id: string;
   content: string;
 }
 
-interface ResponseStats {
+interface Stats {
   received: number;
   inserted: number;
   dropped: number;
   insertion_rate: number;
 }
 
-interface ResponsePayload {
+interface ResponseData {
+  table_name: string;
+  job_id: string;
+  topic: string;
+  industry: string;
+  subindustry: string;
+  similarity_search_score_threshold: number;
+  filter_by: string[];
+  stats: Stats;
+  non_duplicate_messages: NonDuplicateMessage[];
+}
+
+interface ApiResponse {
   status: string;
-  data: {
-    table_name: string;
-    job_id: string;
-    topic: string;
-    industry: string;
-    subindustry: string;
-    similarity_search_score_threshold: number;
-    filter_by: string[];
-    stats: ResponseStats;
-    non_duplicate_messages: ResponseMessage[];
-  };
+  data?: ResponseData;
   message: string;
+  error?: string;
+}
+
+interface FilterParams {
+  conditions: string;
+  values: any[];
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise {
     try {
-      console.log("INFO: Received request");
-
       if (request.method !== "POST") {
-        console.log("INFO: Method not allowed");
         return new Response(
           JSON.stringify({
             status: "error",
-            message: "Method not allowed",
+            message: "Only POST method is allowed",
           }),
           {
             status: 405,
@@ -81,13 +89,8 @@ export default {
         );
       }
 
-      const authToken = request.headers.get("Authorization");
-      if (
-        !authToken ||
-        !authToken.startsWith("Bearer ") ||
-        authToken.slice(7) !== env.DEDUP_AUTH_TOKEN
-      ) {
-        console.log("INFO: Unauthorized request");
+      const authHeader = request.headers.get("Authorization");
+      if (!authHeader || authHeader !== `Bearer ${env.DEDUP_AUTH_TOKEN}`) {
         return new Response(
           JSON.stringify({
             status: "error",
@@ -100,21 +103,54 @@ export default {
         );
       }
 
-      const payload: RequestPayload = await request.json();
-      console.log(
-        `INFO: Processing ${payload.messages.length} messages for job ${payload.job_id}`,
-      );
+      let data: RequestData;
+      try {
+        data = (await request.json()) as RequestData;
+      } catch (error) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            message: "Invalid JSON payload",
+          }),
+          {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
 
-      const result = await processMessages(payload, env);
+      if (
+        !data.table_name ||
+        !data.job_id ||
+        !data.topic ||
+        !data.industry ||
+        data.similarity_search_score_threshold === undefined ||
+        !data.messages ||
+        !Array.isArray(data.messages)
+      ) {
+        return new Response(
+          JSON.stringify({
+            status: "error",
+            message: "Missing required fields",
+          }),
+          {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
 
-      console.log(
-        `INFO: Completed processing. Inserted ${result.data.stats.inserted} messages`,
-      );
+      const filter_by = data.filter_by || ["topic", "subindustry"];
+      const result = await processBatch(data, filter_by, env);
+
       return new Response(JSON.stringify(result), {
+        status: 200,
         headers: { "Content-Type": "application/json" },
       });
     } catch (error) {
-      console.error(`ERROR: Worker exception: ${error.message}`);
+      console.error(
+        `ERROR: Processing request: ${error instanceof Error ? error.message : String(error)}`,
+      );
       return new Response(
         JSON.stringify({
           status: "error",
@@ -129,268 +165,278 @@ export default {
   },
 };
 
-async function processMessages(payload: RequestPayload, env: Env): Promise {
+async function processBatch(
+  data: RequestData,
+  filter_by: string[],
+  env: Env,
+): Promise {
+  const client = new Client({
+    connectionString: env.HYPERDRIVE.connectionString,
+  });
   try {
-    const filter_by = payload.filter_by || ["topic", "subindustry"];
+    await client.connect();
+    console.log("INFO: Connected to database");
 
-    const stats: ResponseStats = {
-      received: payload.messages.length,
+    const stats: Stats = {
+      received: data.messages.length,
       inserted: 0,
       dropped: 0,
       insertion_rate: 0,
     };
 
-    const nonDuplicateMessages: ResponseMessage[] = [];
-
-    console.log("INFO: Removing exact duplicates");
-    const uniqueMessages = removeDuplicatesByContent(payload.messages);
-    stats.dropped = stats.received - uniqueMessages.length;
-    console.log(
-      `INFO: Removed ${stats.dropped} exact duplicates, ${uniqueMessages.length} unique messages remain`,
-    );
-
-    console.log("INFO: Connecting to database");
-    const dbClient = new Client({
-      connectionString: env.HYPERDRIVE.connectionString,
-    });
-    await dbClient.connect();
-
-    try {
-      console.log("INFO: Starting sequential message processing");
-      const insertedMessages = await processMessagesSequentially(
-        uniqueMessages,
-        payload,
-        filter_by,
-        dbClient,
-        env,
-      );
-
-      stats.inserted = insertedMessages.length;
-      stats.dropped += uniqueMessages.length - insertedMessages.length;
-      stats.insertion_rate =
-        stats.received > 0 ? stats.inserted / stats.received : 0;
-
-      insertedMessages.forEach((msg) => {
-        nonDuplicateMessages.push({
-          message_id: msg.message_id,
-          content: msg.content,
-        });
-      });
-
-      console.log(
-        `INFO: Completed processing. Inserted ${stats.inserted} messages, dropped ${stats.dropped} messages`,
-      );
-    } finally {
-      await dbClient.end();
+    const contentToMessageMap = new Map<string, Message>();
+    for (const message of data.messages) {
+      if (!contentToMessageMap.has(message.content)) {
+        contentToMessageMap.set(message.content, message);
+      }
     }
 
-    const response: ResponsePayload = {
+    const uniqueMessages = Array.from(contentToMessageMap.values());
+    const exactDuplicatesCount = data.messages.length - uniqueMessages.length;
+    stats.dropped = exactDuplicatesCount;
+    console.log(
+      `INFO: Removed ${exactDuplicatesCount} exact duplicates. Processing ${uniqueMessages.length} unique messages.`,
+    );
+
+    const modelName = "bge-m3";
+    const allContents = uniqueMessages.map((msg) => msg.content);
+    let allEmbeddings: number[][] = [];
+
+    for (let i = 0; i < allContents.length; i += 100) {
+      try {
+        const contentBatch = allContents.slice(i, i + 100);
+        console.log(
+          `INFO: Generating embeddings for batch ${Math.floor(i / 100) + 1}`,
+        );
+        const response = await env.AI.run(modelName, { text: contentBatch });
+        allEmbeddings = [...allEmbeddings, ...response.data];
+      } catch (error) {
+        console.error(
+          `ERROR: Failed to generate embeddings: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        throw error;
+      }
+    }
+
+    const filterParams = generateFilterParams(filter_by, data);
+    const processedEmbeddings: number[][] = [];
+    const nonDuplicateMessages: NonDuplicateMessage[] = [];
+
+    for (let i = 0; i < uniqueMessages.length; i++) {
+      try {
+        const message = uniqueMessages[i];
+        const embedding = allEmbeddings[i];
+        const formattedEmbedding = `[${embedding.join(",")}]`;
+
+        const dbSimilarityResult = await checkSimilarity(
+          data.table_name,
+          filterParams,
+          formattedEmbedding,
+          client,
+        );
+
+        let maxSimilarityScore = dbSimilarityResult?.similarity_score || 0;
+
+        for (const processedEmbedding of processedEmbeddings) {
+          const similarity = calculateCosineSimilarity(
+            embedding,
+            processedEmbedding,
+          );
+          maxSimilarityScore = Math.max(maxSimilarityScore, similarity);
+        }
+
+        if (maxSimilarityScore < data.similarity_search_score_threshold) {
+          await insertMessage(
+            data.table_name,
+            data.job_id,
+            message,
+            data.topic,
+            data.industry,
+            data.subindustry,
+            formattedEmbedding,
+            maxSimilarityScore,
+            client,
+          );
+
+          processedEmbeddings.push(embedding);
+          stats.inserted++;
+          nonDuplicateMessages.push({
+            message_id: message.message_id,
+            content: message.content,
+          });
+
+          console.log(
+            `INFO: Inserted message ${message.message_id} with similarity score ${maxSimilarityScore}`,
+          );
+        } else {
+          stats.dropped++;
+          console.log(
+            `INFO: Dropped message ${message.message_id} as near-duplicate with similarity score ${maxSimilarityScore}`,
+          );
+        }
+      } catch (error) {
+        console.error(
+          `ERROR: Processing message ${i}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        throw error;
+      }
+    }
+
+    stats.insertion_rate =
+      stats.received > 0 ? stats.inserted / stats.received : 0;
+
+    return {
       status: "success",
       data: {
-        table_name: payload.table_name,
-        job_id: payload.job_id,
-        topic: payload.topic,
-        industry: payload.industry,
-        subindustry: payload.subindustry,
+        table_name: data.table_name,
+        job_id: data.job_id,
+        topic: data.topic,
+        industry: data.industry,
+        subindustry: data.subindustry,
         similarity_search_score_threshold:
-          payload.similarity_search_score_threshold,
+          data.similarity_search_score_threshold,
         filter_by: filter_by,
         stats: stats,
         non_duplicate_messages: nonDuplicateMessages,
       },
       message: "Batch processing completed successfully",
     };
-
-    return response;
-  } catch (error) {
-    console.error(`ERROR: Failed to process messages: ${error.message}`);
-    throw error;
-  }
-}
-
-function removeDuplicatesByContent(messages: Message[]): Message[] {
-  try {
-    const uniqueContents = new Set();
-    return messages.filter((message) => {
-      if (uniqueContents.has(message.content)) {
-        return false;
-      }
-      uniqueContents.add(message.content);
-      return true;
-    });
-  } catch (error) {
-    console.error(`ERROR: Failed to remove duplicates: ${error.message}`);
-    throw error;
-  }
-}
-
-async function processMessagesSequentially(
-  messages: Message[],
-  payload: RequestPayload,
-  filter_by: string[],
-  dbClient: Client,
-  env: Env,
-): Promise<Message[]> {
-  try {
-    const insertedMessages: Message[] = [];
-    const batchSize = 100;
-
-    for (let i = 0; i < messages.length; i += batchSize) {
-      const batch = messages.slice(i, i + batchSize);
-      console.log(
-        `INFO: Processing batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(messages.length / batchSize)}`,
-      );
-
-      const batchTexts = batch.map((msg) => msg.content);
-      const embeddings = await generateEmbeddings(batchTexts, env);
-
-      for (let j = 0; j < batch.length; j++) {
-        const message = batch[j];
-        const embedding = embeddings[j];
-
-        try {
-          const similarityScore = await checkSimilarity(
-            embedding,
-            payload,
-            filter_by,
-            dbClient,
-          );
-
-          if (similarityScore < payload.similarity_search_score_threshold) {
-            await insertMessage(
-              message,
-              embedding,
-              similarityScore,
-              payload,
-              dbClient,
-            );
-
-            insertedMessages.push(message);
-            console.log(
-              `INFO: Inserted message ${message.message_id} with similarity score ${similarityScore}`,
-            );
-          } else {
-            console.log(
-              `INFO: Dropped near-duplicate message ${message.message_id} with similarity score ${similarityScore}`,
-            );
-          }
-        } catch (error) {
-          console.error(
-            `ERROR: Failed to process message ${message.message_id}: ${error.message}`,
-          );
-        }
-      }
-    }
-
-    return insertedMessages;
   } catch (error) {
     console.error(
-      `ERROR: Failed to process messages sequentially: ${error.message}`,
+      `ERROR: Database processing error: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return {
+      status: "error",
+      message: "Error processing batch",
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    try {
+      await client.end();
+      console.log("INFO: Database connection closed");
+    } catch (error) {
+      console.error(
+        `ERROR: Failed to close database connection: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+}
+
+function generateFilterParams(
+  filterBy: string[],
+  data: RequestData,
+): FilterParams {
+  const conditions: string[] = [];
+  const values: any[] = [];
+
+  filterBy.forEach((field) => {
+    if (field === "topic" && data.topic) {
+      conditions.push(`topic = $${values.length + 1}`);
+      values.push(data.topic);
+    } else if (field === "industry" && data.industry) {
+      conditions.push(`industry = $${values.length + 1}`);
+      values.push(data.industry);
+    } else if (field === "subindustry" && data.subindustry) {
+      conditions.push(`subindustry = $${values.length + 1}`);
+      values.push(data.subindustry);
+    } else if (field === "job_id" && data.job_id) {
+      conditions.push(`job_id = $${values.length + 1}`);
+      values.push(data.job_id);
+    }
+  });
+
+  return {
+    conditions:
+      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "",
+    values,
+  };
+}
+
+async function checkSimilarity(
+  tableName: string,
+  filterParams: FilterParams,
+  formattedEmbedding: string,
+  client: Client,
+): Promise<{ similarity_score: number } | null> {
+  try {
+    const values = [...filterParams.values, formattedEmbedding];
+    const embeddingParamIndex = values.length;
+
+    const query = `
+      SELECT 1 - (embedding <=> $${embeddingParamIndex}::vector) as similarity_score
+      FROM ${tableName}
+      ${filterParams.conditions}
+      ORDER BY embedding <=> $${embeddingParamIndex}::vector
+      LIMIT 1;
+    `;
+
+    const result = await client.query(query, values);
+
+    if (result.rows.length === 0) {
+      return null;
+    }
+
+    return {
+      similarity_score: parseFloat(result.rows[0].similarity_score),
+    };
+  } catch (error) {
+    console.error(
+      `ERROR: Failed to check similarity: ${error instanceof Error ? error.message : String(error)}`,
     );
     throw error;
   }
 }
 
-async function generateEmbeddings(
-  texts: string[],
-  env: Env,
-): Promise<number[][]> {
-  try {
-    const modelName = "@cf/baai/bge-base-en-v1.5";
-    console.log(`INFO: Generating embeddings for ${texts.length} texts`);
-
-    const resp = await env.AI.run(modelName, { text: texts });
-    return resp.data;
-  } catch (error) {
-    console.error(`ERROR: Failed to generate embeddings: ${error.message}`);
-    throw new Error(`Failed to generate embeddings: ${error.message}`);
+function calculateCosineSimilarity(vec1: number[], vec2: number[]): number {
+  if (vec1.length !== vec2.length) {
+    throw new Error("Vectors must have the same dimensions");
   }
-}
 
-async function checkSimilarity(
-  embedding: number[],
-  payload: RequestPayload,
-  filter_by: string[],
-  dbClient: Client,
-): Promise {
-  try {
-    const filterParams: any[] = [];
-    const filterConditions = filter_by
-      .map((field) => {
-        if (field === "topic") {
-          filterParams.push(payload.topic);
-          return `topic = $${filterParams.length}`;
-        }
-        if (field === "industry") {
-          filterParams.push(payload.industry);
-          return `industry = $${filterParams.length}`;
-        }
-        if (field === "subindustry") {
-          filterParams.push(payload.subindustry);
-          return `subindustry = $${filterParams.length}`;
-        }
-        if (field === "job_id") {
-          filterParams.push(payload.job_id);
-          return `job_id = $${filterParams.length}`;
-        }
-        return "";
-      })
-      .filter((cond) => cond !== "")
-      .join(" AND ");
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
 
-    if (!filterConditions) {
-      return 0;
-    }
-
-    const formattedEmbedding = `[${embedding.join(",")}]`;
-    filterParams.push(formattedEmbedding);
-
-    const query = `
-      SELECT 1 - (embedding <=> $${filterParams.length}::vector) as similarity_score
-      FROM ${payload.table_name}
-      WHERE ${filterConditions}
-      ORDER BY embedding <=> $${filterParams.length}::vector
-      LIMIT 1;
-    `;
-
-    const result = await dbClient.query(query, filterParams);
-
-    if (result.rows.length === 0) {
-      return 0;
-    }
-
-    return result.rows[0].similarity_score;
-  } catch (error) {
-    console.error(`ERROR: Failed to check similarity: ${error.message}`);
-    throw new Error(`Failed to check similarity: ${error.message}`);
+  for (let i = 0; i < vec1.length; i++) {
+    dotProduct += vec1[i] * vec2[i];
+    normA += vec1[i] * vec1[i];
+    normB += vec2[i] * vec2[i];
   }
+
+  if (normA === 0 || normB === 0) {
+    return 0;
+  }
+
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 async function insertMessage(
+  tableName: string,
+  jobId: string,
   message: Message,
-  embedding: number[],
+  topic: string,
+  industry: string,
+  subindustry: string,
+  formattedEmbedding: string,
   similarityScore: number,
-  payload: RequestPayload,
-  dbClient: Client,
+  client: Client,
 ): Promise {
   try {
-    const formattedEmbedding = `[${embedding.join(",")}]`;
-
     const query = `
-      INSERT INTO ${payload.table_name} 
-      (job_id, message_id, timestamp, topic, industry, subindustry, content, 
-       embedding, similarity_search_score, platform_name, platform_user_id, 
-       platform_message_id, platform_message_url)
+      INSERT INTO ${tableName} (
+        job_id, message_id, timestamp, topic, industry, subindustry, content, 
+        embedding, similarity_search_score, platform_name, platform_user_id, 
+        platform_message_id, platform_message_url
+      ) 
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     `;
 
-    await dbClient.query(query, [
-      payload.job_id,
+    await client.query(query, [
+      jobId,
       message.message_id,
       message.timestamp,
-      payload.topic,
-      payload.industry,
-      payload.subindustry,
+      topic,
+      industry,
+      subindustry,
       message.content,
       formattedEmbedding,
       similarityScore,
@@ -401,8 +447,8 @@ async function insertMessage(
     ]);
   } catch (error) {
     console.error(
-      `ERROR: Failed to insert message ${message.message_id}: ${error.message}`,
+      `ERROR: Failed to insert message: ${error instanceof Error ? error.message : String(error)}`,
     );
-    throw new Error(`Failed to insert message: ${error.message}`);
+    throw error;
   }
 }
