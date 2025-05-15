@@ -2,7 +2,11 @@
 // Do not edit it directly — instead, update the associated test/index.spec.* file and regenerate the code.
 
 import { Client } from "pg";
-type Env = { AI: any; HYPERDRIVE: any; DEDUP_AUTH_TOKEN: string };
+export interface Env {
+  AI: any;
+  HYPERDRIVE: any;
+  DEDUP_AUTH_TOKEN: string;
+}
 type Msg = {
   message_id: string;
   timestamp?: string;
@@ -12,109 +16,134 @@ type Msg = {
   platform_message_id?: string;
   platform_message_url?: string;
 };
-const MODEL = "@cf/baai/bge-m3";
-const EMB_BATCH = 100;
+type Input = {
+  table_name: string;
+  job_id: string;
+  topic: string;
+  industry: string;
+  subindustry?: string;
+  similarity_search_score_threshold: number;
+  filter_by?: string[];
+  messages: Msg[];
+};
 export default {
-  async fetch(req: Request, env: Env): Promise {
-    const start = Date.now();
+  async fetch(req: Request, env: Env) {
+    const log = (l: string, s: string, d: any) =>
+      console.log(`[${l}] ${s} ${JSON.stringify(d)}`);
     try {
-      if (req.method !== "POST") return resp(405, "Only POST allowed");
-      const auth = req.headers.get("Authorization")?.replace(/^Bearer\s+/, "");
-      if (auth !== env.DEDUP_AUTH_TOKEN) return resp(401, "Unauthorized");
-      let body: any;
-      try {
-        body = await req.json();
-      } catch (e) {
-        return resp(400, "Invalid JSON");
-      }
+      if (req.method !== "POST")
+        return new Response("Method Not Allowed", { status: 405 });
+      const apiKey =
+        req.headers.get("x-api-key") ||
+        req.headers.get("authorization")?.replace(/^Bearer\s+/, "");
+      if (apiKey !== env.DEDUP_AUTH_TOKEN)
+        return new Response("Unauthorized", { status: 401 });
+      const body = await req.json();
       const {
         table_name,
         job_id,
         topic,
         industry,
         subindustry,
-        similarity_search_score_threshold: thr,
+        similarity_search_score_threshold,
+        filter_by = ["topic", "subindustry"],
         messages,
       } = body;
-      if (!table_name || !messages || !Array.isArray(messages) || !thr)
-        return resp(400, "Missing fields");
-      if (!/^[a-zA-Z0-9_]+$/.test(table_name))
-        return resp(400, "Invalid table_name");
-      const filter_by: Array = body.filter_by ?? ["topic", "subindustry"];
-      const client = new Client({
-        connectionString: env.HYPERDRIVE.connectionString,
-      });
-      await client.connect();
-      const stats = {
-        received: messages.length,
-        inserted: 0,
-        dropped: 0,
-        insertion_rate: 0,
-      };
-      const non_duplicate_messages: Array<{
-        message_id: string;
-        content: string;
-      }> = [];
-      const seen = new Set();
-      const uniqueMsgs: Msg[] = messages.filter((m) => {
-        if (!m?.content) return false;
-        if (seen.has(m.content)) {
-          stats.dropped++;
-          return false;
-        }
-        seen.add(m.content);
-        return true;
-      });
-      const embeddings = await embed(
-        uniqueMsgs.map((m) => m.content),
-        env,
-      );
-      for (let i = 0; i < uniqueMsgs.length; i++) {
-        const msg = uniqueMsgs[i];
-        const embArr = embeddings[i];
-        const embStr = "[" + embArr.join(",") + "]";
-        const sim = await topSim(client, table_name, embStr, filter_by, {
-          job_id,
-          topic,
-          industry,
-          subindustry,
-        });
-        if (sim >= thr) {
-          stats.dropped++;
-          continue;
-        }
+      if (!table_name || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table_name))
+        return new Response("Invalid table_name", { status: 400 });
+      if (!Array.isArray(messages) || !messages.length)
+        return new Response("No messages provided", { status: 400 });
+      const db = await getClient(env);
+      const stats = { received: messages.length, inserted: 0, dropped: 0 };
+      const nonDuplicates: any[] = [];
+      const seenContents = new Set();
+      const batchSize = 100;
+      for (let i = 0; i < messages.length; i += batchSize) {
+        const slice = messages.slice(i, i + batchSize);
+        const texts = slice.map((m) => m.content);
+        let embeddings: any;
         try {
-          await client.query(
-            `INSERT INTO ${table_name}(job_id,message_id,timestamp,topic,industry,subindustry,content,embedding,similarity_search_score,platform_name,platform_user_id,platform_message_id,platform_message_url)
-       VALUES($1,$2,COALESCE($3,NOW()),$4,$5,$6,$7,$8::vector,$9,$10,$11,$12,$13)`,
-            [
-              job_id,
-              msg.message_id,
-              msg.timestamp,
-              topic,
-              industry,
-              subindustry,
-              msg.content,
-              embStr,
-              sim,
-              msg.platform_name,
-              msg.platform_user_id,
-              msg.platform_message_id,
-              msg.platform_message_url,
-            ],
-          );
-          stats.inserted++;
-          non_duplicate_messages.push({
-            message_id: msg.message_id,
-            content: msg.content,
-          });
+          embeddings = (await env.AI.run("@cf/baai/bge-m3", { text: texts }))
+            .data;
         } catch (e) {
-          console.error("[ERROR] insert", e instanceof Error ? e.message : e);
+          log("ERROR", "EMBEDDINGS", { error: e });
+          return new Response("Embedding error", { status: 500 });
+        }
+        for (let j = 0; j < slice.length; j++) {
+          const m = slice[j];
+          const emb = embeddings[j];
+          if (seenContents.has(m.content)) {
+            stats.dropped++;
+            continue;
+          }
+          seenContents.add(m.content);
+          let dup = false;
+          try {
+            const { rows } = await db.query(
+              `SELECT 1 FROM ${table_name} WHERE content=$1 LIMIT 1`,
+              [m.content],
+            );
+            dup = rows.length > 0;
+          } catch (e) {
+            log("ERROR", "EXACT_DUP_QUERY", { error: e });
+          }
+          if (dup) {
+            stats.dropped++;
+            continue;
+          }
+          const vec = "[" + emb.join(",") + "]";
+          let sim = 0;
+          try {
+            const whereParts: string[] = [];
+            const vals: any[] = [vec];
+            filter_by.forEach((f, idx) => {
+              whereParts.push(`${f}=$${idx + 2}`);
+              vals.push((body as any)[f]);
+            });
+            const sql = `SELECT (1 - (embedding <=> $1::vector)) AS sim FROM ${table_name}${whereParts.length ? " WHERE " + whereParts.join(" AND ") : ""} ORDER BY embedding <=> $1::vector LIMIT 1`;
+            const res = await db.query(sql, vals);
+            if (res.rows.length) sim = parseFloat(res.rows[0].sim);
+          } catch (e) {
+            log("ERROR", "SIM_QUERY", { error: e });
+          }
+          if (sim > similarity_search_score_threshold) {
+            stats.dropped++;
+            continue;
+          }
+          try {
+            await db.query(
+              `INSERT INTO ${table_name}(job_id,message_id,timestamp,topic,industry,subindustry,content,embedding,similarity_search_score,platform_name,platform_user_id,platform_message_id,platform_message_url) VALUES($1,$2,$3,$4,$5,$6,$7,$8::vector,$9,$10,$11,$12,$13)`,
+              [
+                job_id,
+                m.message_id,
+                m.timestamp || new Date().toISOString(),
+                topic,
+                industry,
+                subindustry || null,
+                m.content,
+                vec,
+                sim,
+                m.platform_name || null,
+                m.platform_user_id || null,
+                m.platform_message_id || null,
+                m.platform_message_url || null,
+              ],
+            );
+          } catch (e) {
+            log("ERROR", "INSERT", { error: e });
+            stats.dropped++;
+            continue;
+          }
+          stats.inserted++;
+          nonDuplicates.push({
+            message_id: m.message_id,
+            content: m.content,
+            similarity_search_score: sim,
+          });
         }
       }
-      await client.end();
-      stats.insertion_rate = stats.inserted / stats.received || 0;
-      const res = {
+      stats.dropped = stats.received - stats.inserted;
+      const resp = {
         status: "success",
         data: {
           table_name,
@@ -122,60 +151,28 @@ export default {
           topic,
           industry,
           subindustry,
-          similarity_search_score_threshold: thr,
+          similarity_search_score_threshold,
           filter_by,
-          stats,
-          non_duplicate_messages,
+          stats: { ...stats, insertion_rate: stats.inserted / stats.received },
+          non_duplicate_messages: nonDuplicates,
         },
         message: "Batch processing completed successfully",
-        duration_ms: Date.now() - start,
       };
-      console.log("[INFO] done", res.data.stats);
-      return new Response(JSON.stringify(res), {
-        headers: { "Content-Type": "application/json" },
+      return new Response(JSON.stringify(resp), {
+        headers: { "content-type": "application/json" },
       });
     } catch (e) {
-      console.error("[ERROR] fatal", e instanceof Error ? e.message : e);
-      return resp(500, "Internal error");
+      log("ERROR", "UNHANDLED", { error: e });
+      return new Response("Internal Error", { status: 500 });
     }
   },
 };
-async function embed(texts: string[], env: Env) {
-  const out: number[][] = [];
-  for (let i = 0; i < texts.length; i += EMB_BATCH) {
-    const slice = texts.slice(i, i + EMB_BATCH);
-    const r = await env.AI.run(MODEL, { text: slice });
-    out.push(...r.data);
-  }
-  return out;
-}
-async function topSim(
-  client: Client,
-  table: string,
-  embStr: string,
-  filter_by: string[],
-  vals: any,
-): Promise {
-  const params = [embStr];
-  let where: string[] = [];
-  filter_by.forEach((f) => {
-    if (vals[f] !== undefined) {
-      params.push(vals[f]);
-      where.push(`${f}=$${params.length}`);
-    }
+let cachedClient: Client | undefined;
+async function getClient(env: Env) {
+  if (cachedClient) return cachedClient;
+  cachedClient = new Client({
+    connectionString: env.HYPERDRIVE.connectionString,
   });
-  const q = `SELECT 1-(embedding <=> $1::vector) sim FROM ${table} ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY sim DESC LIMIT 1`;
-  try {
-    const r = await client.query(q, params);
-    return r.rows[0]?.sim ?? 0;
-  } catch (e) {
-    console.error("[ERROR] topsim", e instanceof Error ? e.message : e);
-    return 0;
-  }
-}
-function resp(code: number, msg: string) {
-  return new Response(JSON.stringify({ status: "error", message: msg }), {
-    status: code,
-    headers: { "Content-Type": "application/json" },
-  });
+  await cachedClient.connect();
+  return cachedClient;
 }
