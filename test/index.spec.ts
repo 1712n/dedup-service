@@ -68,10 +68,12 @@
  *       {
  *         "message_id": "msg_001",
  *         "content": "AI is revolutionizing the tech industry!",
+ *         "similarity_search_score": 0.85
  *       },
  *       {
  *         "message_id": "msg_002",
  *         "content": "Machine learning applications are on the rise.",
+ *         "similarity_search_score": 0.76
  *       }
  *     ]
  *   },
