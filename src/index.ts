@@ -2,21 +2,29 @@
 // Do not edit it directly — instead, update the associated test/index.spec.* file and regenerate the code.
 
 import { Client } from "pg";
-export interface Env {
-  AI: any;
-  HYPERDRIVE: any;
+
+interface Env {
+  AI: {
+    run: (
+      model: string,
+      inputs: { text: string[] },
+    ) => Promise<{ data: number[][] }>;
+  };
+  HYPERDRIVE: { connectionString: string };
   DEDUP_AUTH_TOKEN: string;
 }
-type Msg = {
+
+interface Message {
   message_id: string;
-  timestamp?: string;
+  timestamp: string;
   content: string;
   platform_name?: string;
   platform_user_id?: string;
   platform_message_id?: string;
   platform_message_url?: string;
-};
-type Input = {
+}
+
+interface InputPayload {
   table_name: string;
   job_id: string;
   topic: string;
@@ -24,155 +32,383 @@ type Input = {
   subindustry?: string;
   similarity_search_score_threshold: number;
   filter_by?: string[];
-  messages: Msg[];
-};
+  messages: Message[];
+}
+
+interface NonDuplicateMessageInfo {
+  message_id: string;
+  content: string;
+  similarity_search_score: number;
+}
+
+interface Stats {
+  received: number;
+  inserted: number;
+  dropped: number;
+  insertion_rate: number;
+}
+
+interface ResponseData {
+  table_name: string;
+  job_id: string;
+  topic: string;
+  industry: string;
+  subindustry?: string;
+  similarity_search_score_threshold: number;
+  filter_by: string[];
+  stats: Stats;
+  non_duplicate_messages: NonDuplicateMessageInfo[];
+}
+
+const MODEL_NAME = "@cf/baai/bge-m3";
+const TABLE_NAME_REGEX = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+
+function buildFilterConditionsSql(
+  filterByFields: string[],
+  payload: InputPayload,
+  queryParams: any[],
+): string {
+  const conditions: string[] = [];
+  const filterSource: Record<string, string | undefined> = {
+    job_id: payload.job_id,
+    topic: payload.topic,
+    industry: payload.industry,
+    subindustry: payload.subindustry,
+  };
+
+  for (const field of filterByFields) {
+    if (!Object.prototype.hasOwnProperty.call(filterSource, field)) {
+      console.warn(
+        `WARN: [QueryBuilder] Unknown field in filter_by: ${field} | JobID: ${payload.job_id}`,
+      );
+      continue;
+    }
+    const value = filterSource[field];
+    if (value === undefined || value === null) {
+      conditions.push(`${field} IS NULL`);
+    } else {
+      conditions.push(`${field} = $${queryParams.length + 1}`);
+      queryParams.push(value);
+    }
+  }
+  return conditions.length > 0 ? conditions.join(" AND ") : "TRUE";
+}
+
 export default {
-  async fetch(req: Request, env: Env) {
-    const log = (l: string, s: string, d: any) =>
-      console.log(`[${l}] ${s} ${JSON.stringify(d)}`);
+  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise {
+    const rayIdForEarlyLog = request.headers.get("CF-Ray") || "unknown";
+
+    if (request.method !== "POST") {
+      console.log(
+        `INFO: [Auth] MethodNotAllowed | RayID: ${rayIdForEarlyLog} | Method: ${request.method}`,
+      );
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          message: "Method not allowed. Use POST.",
+        }),
+        { status: 405, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    const authHeader = request.headers.get("Authorization");
+    if (!authHeader || authHeader !== `Bearer ${env.DEDUP_AUTH_TOKEN}`) {
+      console.log(`INFO: [Auth] AuthFailed | RayID: ${rayIdForEarlyLog}`);
+      return new Response(
+        JSON.stringify({ status: "error", message: "Authentication failed." }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    let payload: InputPayload;
     try {
-      if (req.method !== "POST")
-        return new Response("Method Not Allowed", { status: 405 });
-      const apiKey =
-        req.headers.get("x-api-key") ||
-        req.headers.get("authorization")?.replace(/^Bearer\s+/, "");
-      if (apiKey !== env.DEDUP_AUTH_TOKEN)
-        return new Response("Unauthorized", { status: 401 });
-      const body = await req.json();
-      const {
+      payload = await request.json();
+    } catch (e: any) {
+      console.error(
+        `ERROR: [InputParse] JSONParseFailed | RayID: ${rayIdForEarlyLog} | Details: ${e.message}`,
+      );
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          message: "Invalid JSON payload.",
+          error: e.message,
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    const job_id = payload.job_id || rayIdForEarlyLog;
+    console.log(
+      `INFO: [InputParse] PayloadReceived | JobID: ${job_id} | Messages: ${payload.messages?.length || 0}`,
+    );
+
+    const {
+      table_name,
+      topic,
+      industry,
+      subindustry,
+      similarity_search_score_threshold,
+      messages,
+    } = payload;
+    const filter_by = payload.filter_by || ["topic", "subindustry"];
+
+    if (
+      !table_name ||
+      !payload.job_id ||
+      !topic ||
+      !industry ||
+      similarity_search_score_threshold === undefined ||
+      !messages
+    ) {
+      console.error(
+        `ERROR: [InputValidation] MissingRequiredFields | JobID: ${job_id}`,
+      );
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          message:
+            "Missing required fields: table_name, job_id, topic, industry, similarity_search_score_threshold, messages.",
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (!TABLE_NAME_REGEX.test(table_name)) {
+      console.error(
+        `ERROR: [InputValidation] InvalidTableName | JobID: ${job_id} | TableName: ${table_name}`,
+      );
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          message: `Invalid table_name: ${table_name}. Must be alphanumeric/underscores, start with letter/underscore.`,
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    const stats: Stats = {
+      received: messages.length,
+      inserted: 0,
+      dropped: 0,
+      insertion_rate: 0,
+    };
+    const non_duplicate_messages_output: NonDuplicateMessageInfo[] = [];
+
+    const uniqueContentMessagesMap = new Map<string, Message>();
+    for (const msg of messages) {
+      if (
+        msg.content === undefined ||
+        msg.content === null ||
+        typeof msg.content !== "string" ||
+        msg.content.trim() === ""
+      ) {
+        console.warn(
+          `WARN: [InputValidation] MsgContentInvalid | JobID: ${job_id} | MsgID: ${msg.message_id}`,
+        );
+        stats.dropped++;
+        continue;
+      }
+      if (!uniqueContentMessagesMap.has(msg.content)) {
+        uniqueContentMessagesMap.set(msg.content, msg);
+      } else {
+        stats.dropped++;
+      }
+    }
+
+    const messagesToProcess = Array.from(uniqueContentMessagesMap.values());
+
+    if (messagesToProcess.length === 0) {
+      stats.insertion_rate = 0;
+      const responseData: ResponseData = {
         table_name,
-        job_id,
+        job_id: payload.job_id,
         topic,
         industry,
         subindustry,
         similarity_search_score_threshold,
-        filter_by = ["topic", "subindustry"],
-        messages,
-      } = body;
-      if (!table_name || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table_name))
-        return new Response("Invalid table_name", { status: 400 });
-      if (!Array.isArray(messages) || !messages.length)
-        return new Response("No messages provided", { status: 400 });
-      const db = await getClient(env);
-      const stats = { received: messages.length, inserted: 0, dropped: 0 };
-      const nonDuplicates: any[] = [];
-      const seenContents = new Set();
-      const batchSize = 100;
-      for (let i = 0; i < messages.length; i += batchSize) {
-        const slice = messages.slice(i, i + batchSize);
-        const texts = slice.map((m) => m.content);
-        let embeddings: any;
+        filter_by,
+        stats,
+        non_duplicate_messages: [],
+      };
+      const reason =
+        stats.received > 0
+          ? "All messages were duplicates or invalid."
+          : "No processable messages received.";
+      console.log(
+        `INFO: [ProcessingComplete] NoMessagesToProcess | JobID: ${job_id} | Reason: ${reason}`,
+      );
+      return new Response(
+        JSON.stringify({
+          status: "success",
+          data: responseData,
+          message: `Batch processing completed. ${reason}`,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    let pgClient: Client | null = null;
+    try {
+      pgClient = new Client({
+        connectionString: env.HYPERDRIVE.connectionString,
+      });
+      await pgClient.connect();
+      console.log(`INFO: [DBConnect] ConnectedToHyperdrive | JobID: ${job_id}`);
+
+      for (const msg of messagesToProcess) {
+        let embeddingVector: number[];
         try {
-          embeddings = (await env.AI.run("@cf/baai/bge-m3", { text: texts }))
-            .data;
-        } catch (e) {
-          log("ERROR", "EMBEDDINGS", { error: e });
-          return new Response("Embedding error", { status: 500 });
-        }
-        for (let j = 0; j < slice.length; j++) {
-          const m = slice[j];
-          const emb = embeddings[j];
-          if (seenContents.has(m.content)) {
-            stats.dropped++;
-            continue;
-          }
-          seenContents.add(m.content);
-          let dup = false;
-          try {
-            const { rows } = await db.query(
-              `SELECT 1 FROM ${table_name} WHERE content=$1 LIMIT 1`,
-              [m.content],
-            );
-            dup = rows.length > 0;
-          } catch (e) {
-            log("ERROR", "EXACT_DUP_QUERY", { error: e });
-          }
-          if (dup) {
-            stats.dropped++;
-            continue;
-          }
-          const vec = "[" + emb.join(",") + "]";
-          let sim = 0;
-          try {
-            const whereParts: string[] = [];
-            const vals: any[] = [vec];
-            filter_by.forEach((f, idx) => {
-              whereParts.push(`${f}=$${idx + 2}`);
-              vals.push((body as any)[f]);
-            });
-            const sql = `SELECT (1 - (embedding <=> $1::vector)) AS sim FROM ${table_name}${whereParts.length ? " WHERE " + whereParts.join(" AND ") : ""} ORDER BY embedding <=> $1::vector LIMIT 1`;
-            const res = await db.query(sql, vals);
-            if (res.rows.length) sim = parseFloat(res.rows[0].sim);
-          } catch (e) {
-            log("ERROR", "SIM_QUERY", { error: e });
-          }
-          if (sim > similarity_search_score_threshold) {
-            stats.dropped++;
-            continue;
-          }
-          try {
-            await db.query(
-              `INSERT INTO ${table_name}(job_id,message_id,timestamp,topic,industry,subindustry,content,embedding,similarity_search_score,platform_name,platform_user_id,platform_message_id,platform_message_url) VALUES($1,$2,$3,$4,$5,$6,$7,$8::vector,$9,$10,$11,$12,$13)`,
-              [
-                job_id,
-                m.message_id,
-                m.timestamp || new Date().toISOString(),
-                topic,
-                industry,
-                subindustry || null,
-                m.content,
-                vec,
-                sim,
-                m.platform_name || null,
-                m.platform_user_id || null,
-                m.platform_message_id || null,
-                m.platform_message_url || null,
-              ],
-            );
-          } catch (e) {
-            log("ERROR", "INSERT", { error: e });
-            stats.dropped++;
-            continue;
-          }
-          stats.inserted++;
-          nonDuplicates.push({
-            message_id: m.message_id,
-            content: m.content,
-            similarity_search_score: sim,
+          const aiResponse = await env.AI.run(MODEL_NAME, {
+            text: [msg.content],
           });
+          if (
+            !aiResponse.data ||
+            !aiResponse.data[0] ||
+            aiResponse.data[0].length === 0
+          ) {
+            throw new Error("AI response missing data or empty embedding");
+          }
+          embeddingVector = aiResponse.data[0];
+        } catch (e: any) {
+          console.error(
+            `ERROR: [AIEmbedding] EmbeddingFailed | JobID: ${job_id} | MsgID: ${msg.message_id} | Details: ${e.message}`,
+          );
+          stats.dropped++;
+          continue;
+        }
+        const formattedEmbedding = `[${embeddingVector.join(",")}]`;
+
+        let current_similarity_score = 0.0;
+        const similarityQueryParams: any[] = [formattedEmbedding];
+        const filterClauseSql = buildFilterConditionsSql(
+          filter_by,
+          payload,
+          similarityQueryParams,
+        );
+
+        const similarityQuery = `SELECT 1 - (embedding <=> $1::vector) AS similarity_score FROM ${table_name} WHERE ${filterClauseSql} ORDER BY embedding <=> $1::vector LIMIT 1;`;
+
+        try {
+          const similarityResult = await pgClient.query(
+            similarityQuery,
+            similarityQueryParams,
+          );
+          if (
+            similarityResult.rows.length > 0 &&
+            similarityResult.rows[0].similarity_score !== null
+          ) {
+            current_similarity_score = parseFloat(
+              similarityResult.rows[0].similarity_score,
+            );
+          }
+        } catch (e: any) {
+          console.error(
+            `ERROR: [DBSimilaritySearch] SearchFailed | JobID: ${job_id} | MsgID: ${msg.message_id} | Details: ${e.message}`,
+          );
+          stats.dropped++;
+          continue;
+        }
+
+        if (current_similarity_score < similarity_search_score_threshold) {
+          try {
+            const insertQuery = `INSERT INTO ${table_name} (job_id, message_id, timestamp, topic, industry, subindustry, content, embedding, similarity_search_score, platform_name, platform_user_id, platform_message_id, platform_message_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9, $10, $11, $12, $13);`;
+            const insertParams = [
+              payload.job_id,
+              msg.message_id,
+              msg.timestamp,
+              topic,
+              industry,
+              subindustry,
+              msg.content,
+              formattedEmbedding,
+              current_similarity_score,
+              msg.platform_name,
+              msg.platform_user_id,
+              msg.platform_message_id,
+              msg.platform_message_url,
+            ];
+            await pgClient.query(insertQuery, insertParams);
+            stats.inserted++;
+            non_duplicate_messages_output.push({
+              message_id: msg.message_id,
+              content: msg.content,
+              similarity_search_score: current_similarity_score,
+            });
+            console.log(
+              `INFO: [DBInsert] MessageInserted | JobID: ${job_id} | MsgID: ${msg.message_id} | Score: ${current_similarity_score}`,
+            );
+          } catch (e: any) {
+            console.error(
+              `ERROR: [DBInsert] InsertFailed | JobID: ${job_id} | MsgID: ${msg.message_id} | Details: ${e.message}`,
+            );
+            stats.dropped++;
+          }
+        } else {
+          stats.dropped++;
+          console.log(
+            `INFO: [Deduplication] MessageDropped | JobID: ${job_id} | MsgID: ${msg.message_id} | Score: ${current_similarity_score} | Threshold: ${similarity_search_score_threshold}`,
+          );
         }
       }
-      stats.dropped = stats.received - stats.inserted;
-      const resp = {
-        status: "success",
-        data: {
-          table_name,
-          job_id,
-          topic,
-          industry,
-          subindustry,
-          similarity_search_score_threshold,
-          filter_by,
-          stats: { ...stats, insertion_rate: stats.inserted / stats.received },
-          non_duplicate_messages: nonDuplicates,
-        },
-        message: "Batch processing completed successfully",
-      };
-      return new Response(JSON.stringify(resp), {
-        headers: { "content-type": "application/json" },
-      });
-    } catch (e) {
-      log("ERROR", "UNHANDLED", { error: e });
-      return new Response("Internal Error", { status: 500 });
+    } catch (e: any) {
+      console.error(
+        `ERROR: [Processing] UnhandledError | JobID: ${job_id} | Details: ${e.message}`,
+      );
+      if (pgClient) {
+        await pgClient
+          .end()
+          .catch((err) =>
+            console.error(
+              `ERROR: [DBClose] ClientCloseFailedOnError | JobID: ${job_id} | Details: ${err.message}`,
+            ),
+          );
+      }
+      return new Response(
+        JSON.stringify({
+          status: "error",
+          message: "An error occurred during batch processing.",
+          error: e.message,
+        }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      );
+    } finally {
+      if (pgClient) {
+        await pgClient
+          .end()
+          .catch((err) =>
+            console.error(
+              `ERROR: [DBClose] ClientCloseFailedFinally | JobID: ${job_id} | Details: ${err.message}`,
+            ),
+          );
+      }
     }
+
+    stats.insertion_rate =
+      stats.received > 0
+        ? parseFloat((stats.inserted / stats.received).toFixed(4))
+        : 0;
+
+    const responseData: ResponseData = {
+      table_name,
+      job_id: payload.job_id,
+      topic,
+      industry,
+      subindustry,
+      similarity_search_score_threshold,
+      filter_by,
+      stats,
+      non_duplicate_messages: non_duplicate_messages_output,
+    };
+    console.log(
+      `INFO: [ProcessingComplete] BatchFinished | JobID: ${job_id} | Rcvd: ${stats.received} | Ins: ${stats.inserted} | Drpd: ${stats.dropped} | Rate: ${stats.insertion_rate}`,
+    );
+    return new Response(
+      JSON.stringify({
+        status: "success",
+        data: responseData,
+        message: "Batch processing completed successfully",
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
   },
 };
-let cachedClient: Client | undefined;
-async function getClient(env: Env) {
-  if (cachedClient) return cachedClient;
-  cachedClient = new Client({
-    connectionString: env.HYPERDRIVE.connectionString,
-  });
-  await cachedClient.connect();
-  return cachedClient;
-}
