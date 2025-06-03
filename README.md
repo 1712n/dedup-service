@@ -5,6 +5,6 @@ A high-performance service designed to eliminate duplicate and near-duplicate co
 ## Implementation approach
 
 This service demonstrates how to effectively handle exact and semantic duplicates in data collection workflows:
-- **Cloudflare Workers + Workers AI**: Vector embeddings ([bge-m3](https://developers.cloudflare.com/workers-ai/models/bge-m3/) for semantic comparison
+- **Cloudflare Workers + Workers AI**: Vector embeddings ([bge-m3](https://developers.cloudflare.com/workers-ai/models/bge-m3/)) for semantic comparison
 - **PostgreSQL + pgvector**: Vector storage and cosine similarity search
 - **Two-stage filtering**: Content hash filtering → Vector similarity threshold
