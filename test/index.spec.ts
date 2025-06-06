@@ -20,7 +20,7 @@
  *   "industry": "finance",
  *   "subindustry": "blockchain",
  *   "similarity_search_score_threshold": 0.9,
- *   "filter_by": ["topic", "subindustry", "job_id"], // optional, default value is ["topic", "subindustry"]
+ *   "filter_by": ["topic", "industry", "job_id"], // optional, default value is ["topic", "industry"]
  *   "messages": [
  *     {
  *       "message_id": "msg_001",
@@ -57,7 +57,7 @@
  *     "industry": "finance",
  *     "subindustry": "blockchain",
  *     "similarity_search_score_threshold": 0.9,
- *     "filter_by": ["topic", "subindustry", "job_id"]
+ *     "filter_by": ["topic", "industry", "job_id"]
  *     "stats": {
  *       "received": 50,
  *       "inserted": 40,
