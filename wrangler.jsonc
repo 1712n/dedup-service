@@ -21,7 +21,7 @@
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",
-      "id": "6d838af447464824818c4fe6f3ac394e",
+      "id": "7ed370fe924448f0a782e08544c4650f",
       "localConnectionString": "postgres://postgres:password@localhost:5432/class_worker_db"
     }
   ]
